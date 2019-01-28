@@ -1,14 +1,15 @@
 import types
-from collections import OrderedDict, namedtuple
+from collections import OrderedDict
 from textwrap import dedent
-import six
 from boltons.funcutils import FunctionBuilder
+
+import owslib
 from owslib.util import ServiceException
-from owslib.wps import WPS_DEFAULT_VERSION, WebProcessingService, SYNC, ASYNC
+from owslib.wps import WPS_DEFAULT_VERSION, WebProcessingService, SYNC, ASYNC, ComplexData
 
 from birdy.exceptions import UnauthorizedException
 from birdy.client import utils
-from birdy.utils import sanitize
+from birdy.utils import sanitize, fix_url, embed
 from birdy.client import notebook
 from birdy.client.outputs import WPSResult
 
@@ -84,25 +85,9 @@ class WPSClient(object):
                 )
             raise
 
-        wps_processes = OrderedDict((p.identifier, p) for p in self._wps.processes)
+        self._processes = self._get_process_description(processes)
 
-        if processes is None:
-            processes = list(wps_processes)
-        elif isinstance(processes, six.string_types):
-            processes = [processes]
-
-        process_names, missing = utils.filter_case_insensitive(
-            processes, list(wps_processes)
-        )
-
-        if missing:
-            message = "These process names are not on the WPS server: {}"
-            raise ValueError(message.format(", ".join(missing)))
-
-        self._processes = OrderedDict(
-            (name, wps_processes[name]) for name in process_names
-        )
-
+        # Build the methods
         for pid in self._processes:
             setattr(self, sanitize(pid), types.MethodType(self._method_factory(pid), self))
 
@@ -111,6 +96,45 @@ class WPSClient(object):
             self._setup_logging()
 
         self.__doc__ = utils.build_wps_client_doc(self._wps, self._processes)
+
+    def _get_process_description(self, processes):
+        """Return the description for each process.
+
+        Sends the server a `describeProcess` request for each process.
+
+        Parameters
+        ----------
+        processes: str, list, None
+          A process name, a list of process names or None (for all processes).
+
+        Returns
+        -------
+        OrderedDict
+          A dictionary keyed by the process identifier of process descriptions.
+        """
+        all_wps_processes = [p.identifier for p in self._wps.processes]
+
+        if processes is None:
+            if owslib.__version__ > '0.17.0':
+                # Get the description for all processes in one request.
+                ps = self._wps.describeprocess('all')
+                return OrderedDict((p.identifier, p) for p in ps)
+            else:
+                processes = all_wps_processes
+
+        # Check for invalid process names, i.e. not matching the getCapabilities response.
+
+        process_names, missing = utils.filter_case_insensitive(
+            processes, all_wps_processes)
+
+        if missing:
+            message = "These process names were not found on the WPS server: {}"
+            raise ValueError(message.format(", ".join(missing)))
+
+        # Get the description for each process.
+        ps = [self._wps.describeprocess(pid) for pid in process_names]
+
+        return OrderedDict((p.identifier, p) for p in ps)
 
     def _setup_logging(self):
         self.logger.setLevel(logging.INFO)
@@ -123,17 +147,16 @@ class WPSClient(object):
         """Create a custom function signature with docstring, instantiate it and
         pass it to a wrapper which will actually call the process.
 
-        Args:
-            pid: Identifier of the WPS process
+        Parameters
+        ----------
+        pid: str
+          Identifier of the WPS process.
+
+        Returns
+        -------
+        func
+          A Python function calling the remote process, complete with docstring and signature.
         """
-        try:
-            self._processes[pid] = self._wps.describeprocess(pid)
-        except ServiceException as e:
-            if "AccessForbidden" in str(e):
-                raise UnauthorizedException(
-                    "You are not authorized to do a request of type: DescribeProcess"
-                )
-            raise
 
         process = self._processes[pid]
 
@@ -176,11 +199,25 @@ class WPSClient(object):
         return func
 
     def _execute(self, pid, **kwargs):
+        """Execute the process."""
         wps_inputs = []
         for name, input_param in self._inputs[pid].items():
             value = kwargs.get(name)
             if value is not None:
-                wps_inputs.append((name, utils.to_owslib(value, input_param.dataType, )))
+                if isinstance(input_param.defaultValue, ComplexData):
+                    encoding = input_param.defaultValue.encoding
+                    mimetype = input_param.defaultValue.mimeType
+
+                    if utils.is_embedded_in_request(self._wps.url, value):
+                        # If encoding is None, this will return the actual encoding used (utf-8 or base64).
+                        value, encoding = embed(value, mimetype, encoding=encoding)
+                    else:
+                        value = fix_url(value)
+                    inp = utils.to_owslib(value, data_type=input_param.dataType, encoding=encoding, mimetype=mimetype)
+
+                else:
+                    inp = utils.to_owslib(value, data_type=input_param.dataType)
+                wps_inputs.append((name, inp))
 
         wps_outputs = [
             (o.identifier, "ComplexData" in o.dataType)
