@@ -188,7 +188,7 @@ def is_embedded_in_request(url, value):
         scheme = 'file'
     else:  # String-like
         v = urlparse(value)
-        p = Path(v.path)
+        p = Path(v.path[:255])
         scheme = v.scheme
 
     if scheme == 'file':  # Explicit link to file

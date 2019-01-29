@@ -73,7 +73,7 @@ def embed(value, mimetype=None, encoding=None):
             u = urlparse(value)
             path = u.path
 
-        if Path(path).is_file():
+        if Path(path[:255]).is_file():
             mode = 'rb' if mimetype in BINARY_MIMETYPES else 'r'
             with open(path, mode) as fp:
                 content = fp.read()
